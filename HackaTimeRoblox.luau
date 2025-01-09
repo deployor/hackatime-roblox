@@ -139,20 +139,105 @@ local saveAPIKey
 local loadAPIKey
 local tokenInput
 
---- Function to Get the Game's Name ---
-local function getGameName()
-    local success, result = pcall(function()
-        return MarketplaceService:GetProductInfo(game.PlaceId).Name
-    end)
-    if success and result then
-        return result
-    else
-        return nil
+-- Add near other global variables
+local WAKATIME_ID_KEY = "WakaTimeProjectId"
+local projectLabel = nil  -- Add this global variable
+
+-- Forward declare functions to avoid reference issues
+local getCurrentProjectName
+local refreshProjectName
+
+refreshProjectName = function()
+    CurrentProject = getCurrentProjectName()
+    if projectLabel then
+        projectLabel.Text = "Project: " .. CurrentProject
     end
 end
 
--- Set the current project name, prioritizing the game's name
-CurrentProject = getGameName() or (game.PlaceId > 0 and tostring(game.PlaceId)) or "Unnamed Project"
+getCurrentProjectName = function()
+    -- Try to find existing project ID first
+    local storedId = game:GetService("ReplicatedStorage"):FindFirstChild(WAKATIME_ID_KEY)
+    if storedId and storedId:IsA("StringValue") and storedId.Value ~= "" then
+        return storedId.Value -- Use stored ID directly without prefix
+    end
+
+    -- Default names to ignore
+    local defaultNames = {
+        ["Game"] = true,
+        ["Workspace"] = true,
+        ["StarterPlayer"] = true,
+        ["ReplicatedFirst"] = true,
+        ["BaseGame"] = true,
+        ["TestPlace"] = true,
+        ["Project"] = true,
+        ["Untitled"] = true,
+        [""] = true
+    }
+    
+    local projectName = nil
+    
+    -- Try getting from MarketplaceService first (published games)
+    pcall(function()
+        local info = MarketplaceService:GetProductInfo(game.PlaceId)
+        if info and info.Name and not defaultNames[info.Name] then
+            projectName = info.Name
+        end
+    end)
+    
+    -- Try getting from DataModel name if no marketplace name
+    if not projectName and not defaultNames[game.Name] then
+        projectName = game.Name
+    end
+    
+    -- Try getting workspace name if still no name
+    if not projectName and not defaultNames[workspace.Name] then
+        projectName = workspace.Name
+    end
+    
+    -- Use place ID if available and no other name found
+    if not projectName and game.PlaceId and game.PlaceId > 0 then
+        projectName = "Place" .. tostring(game.PlaceId)
+    end
+    
+    -- If we found a valid name, store and use it
+    if projectName then
+        local idValue = Instance.new("StringValue")
+        idValue.Name = WAKATIME_ID_KEY
+        idValue.Value = projectName
+        
+        -- Try to store in ReplicatedStorage
+        pcall(function()
+            idValue.Parent = game:GetService("ReplicatedStorage")
+            
+            -- Add explanation comment
+            local comment = Instance.new("Message")
+            comment.Parent = idValue
+            comment.Text = "This is a WakaTime project identifier. Please don't delete it - it helps track your coding time consistently."
+        end)
+        
+        return projectName
+    end
+    
+    -- Last resort: generate random ID
+    local newId = HttpService:GenerateGUID(false):sub(1, 8)
+    local idValue = Instance.new("StringValue")
+    idValue.Name = WAKATIME_ID_KEY
+    idValue.Value = "RoProject-" .. newId
+    
+    pcall(function()
+        idValue.Parent = game:GetService("ReplicatedStorage")
+        
+        -- Add explanation comment
+        local comment = Instance.new("Message")
+        comment.Parent = idValue
+        comment.Text = "This is a WakaTime project identifier. Please don't delete it - it helps track your coding time consistently."
+    end)
+    
+    return "RoProject-" .. newId
+end
+
+-- Set the current project name, with improved fallbacks
+CurrentProject = getCurrentProjectName()  -- Updated function call
 
 --- Toolbar and Button Setup ---
 local toolbar = plugin:CreateToolbar("WakaTime Plugin")
@@ -270,8 +355,16 @@ local function addHeartbeat(scriptName, activity)
     end
 end
 
--- Connect to ScriptEditorService events
+local function isConsole(document)
+    local name = document.Name and document.Name:lower() or ""
+    return name:match("output") or name:match("console")
+end
+
 ScriptEditorService.TextDocumentDidChange:Connect(function(document)
+    if isConsole(document) then
+        return
+    end
+
     local scriptName = document.Name or "Unnamed Script"
 
     local success, source = pcall(function()
@@ -287,7 +380,6 @@ ScriptEditorService.TextDocumentDidChange:Connect(function(document)
         pcall(function()
             local selection = document.Selection
             if selection then
-                -- Selection.Character is 1-based and represents the column within the line
                 cursorPosition.Line = selection.Line
                 cursorPosition.Character = selection.Character
             end
@@ -304,7 +396,7 @@ ScriptEditorService.TextDocumentDidChange:Connect(function(document)
         end
     else
         -- Fallback
-		addHeartbeat(scriptName)
+        addHeartbeat(scriptName)
     end
 end)
 
@@ -345,6 +437,10 @@ local ERROR_CODES = {
 -- Add a variable to store the last error code
 local LastErrorCode
 
+-- Add near other global variables
+local LastStatusMessage = ""
+local HasSuccessfullyConnected = false  -- Add this new variable
+
 --- Send Heartbeats ---
 sendHeartbeats = function()
     if #HeartbeatQueue == 0 then
@@ -372,32 +468,41 @@ sendHeartbeats = function()
     end)
 
     if not success then
-        warn(ERROR_CODES.NETWORK_ERROR, "Network error: " .. tostring(response))
+        LastStatusMessage = "Network error: " .. tostring(response)
+        warn(ERROR_CODES.NETWORK_ERROR, LastStatusMessage)
         IsOffline = true
         LastErrorCode = ERROR_CODES.NETWORK_ERROR
         return
     end
 
     if response.Success then
-        print("Successfully sent " .. #HeartbeatQueue .. " heartbeats to WakaTime.")
+        LastStatusMessage = "Successfully sent " .. #HeartbeatQueue .. " heartbeats"
+        print(LastStatusMessage)
         HeartbeatQueue = {}
         persistQueue()
         IsOffline = false
         LastErrorCode = nil
+        HasSuccessfullyConnected = true  -- Set to true on successful heartbeat
     else
         local errorCode = ERROR_CODES.UNKNOWN
         local statusCode = response.StatusCode
+        local errorMessage = tostring(response.StatusMessage)
 
         if statusCode == 401 then
             errorCode = ERROR_CODES.AUTH_ERROR
+            LastStatusMessage = "Authentication failed. Please check your API key"
         elseif statusCode == 429 then
             errorCode = ERROR_CODES.RATE_LIMIT
+            LastStatusMessage = "Rate limit reached. Please wait"
         elseif statusCode >= 500 then
             errorCode = ERROR_CODES.SERVER_ERROR
+            LastStatusMessage = "Server error: " .. errorMessage
+        else
+            LastStatusMessage = "Unknown error: " .. errorMessage
         end
 
         warn(errorCode, "Failed to send heartbeats. Status: " .. tostring(statusCode) ..
-                " - " .. tostring(response.StatusMessage))
+                " - " .. errorMessage)
         IsOffline = true
         LastErrorCode = errorCode
 
@@ -495,6 +600,18 @@ local function createGUI()
     warningLabel.BackgroundTransparency = 1
     warningLabel.TextWrapped = true
     warningLabel.Parent = mainFrame
+    currentPosition = currentPosition + buttonHeight * 0.8 + spacing
+
+    -- Project Name Label (update to use global variable)
+    projectLabel = Instance.new("TextLabel")  -- Remove local, use global
+    projectLabel.Size = UDim2.new(0.9, 0, buttonHeight * 0.8, 0)
+    projectLabel.Position = UDim2.new(0.05, 0, currentPosition, 0)
+    projectLabel.Text = "Project: " .. CurrentProject
+    projectLabel.TextColor3 = colors.Text
+    projectLabel.BackgroundTransparency = 1
+    projectLabel.TextXAlignment = Enum.TextXAlignment.Left
+    projectLabel.TextWrapped = true
+    projectLabel.Parent = mainFrame
     currentPosition = currentPosition + buttonHeight * 0.8 + spacing
 
     local function addCorners(button)
@@ -648,10 +765,76 @@ local function createGUI()
     addCorners(submitButton)
     currentPosition = currentPosition + buttonHeight + spacing
 
-    -- Status label at bottom
+    -- Add Project ID section (new)
+    local projectIdLabel = Instance.new("TextLabel")
+    projectIdLabel.Size = UDim2.new(0.9, 0, buttonHeight * 0.8, 0)
+    projectIdLabel.Position = UDim2.new(0.05, 0, currentPosition, 0)
+    projectIdLabel.Text = "Override Project Name:"  -- Changed text
+    projectIdLabel.TextColor3 = colors.Text
+    projectIdLabel.BackgroundTransparency = 1
+    projectIdLabel.TextXAlignment = Enum.TextXAlignment.Left
+    projectIdLabel.Parent = mainFrame
+    currentPosition = currentPosition + buttonHeight * 0.8 + spacing
+
+    local projectIdInput = Instance.new("TextBox")
+    projectIdInput.Size = UDim2.new(0.6, 0, buttonHeight, 0)
+    projectIdInput.Position = UDim2.new(0.05, 0, currentPosition, 0)
+    projectIdInput.PlaceholderText = "Enter project name..."  -- Changed placeholder
+    projectIdInput.Text = ""
+    projectIdInput.TextColor3 = colors.Text
+    projectIdInput.BackgroundColor3 = colors.ButtonBackground
+    projectIdInput.Parent = mainFrame
+    addCorners(projectIdInput)
+
+    local setProjectIdButton = Instance.new("TextButton")
+    setProjectIdButton.Size = UDim2.new(0.25, 0, buttonHeight, 0)
+    setProjectIdButton.Position = UDim2.new(0.7, 0, currentPosition, 0)
+    setProjectIdButton.Text = "Set ID"
+    setProjectIdButton.BackgroundColor3 = colors.ButtonBackground
+    setProjectIdButton.TextColor3 = colors.ButtonText
+    setProjectIdButton.Parent = mainFrame
+    addCorners(setProjectIdButton)
+    currentPosition = currentPosition + buttonHeight + spacing
+
+    setProjectIdButton.MouseButton1Click:Connect(function()
+        local newId = projectIdInput.Text
+        if newId and newId ~= "" then
+            local idValue = Instance.new("StringValue")
+            idValue.Name = WAKATIME_ID_KEY
+            idValue.Value = newId
+            
+            -- Try to store in ReplicatedStorage
+            local success = pcall(function()
+                -- Remove existing ID if any
+                local existing = game:GetService("ReplicatedStorage"):FindFirstChild(WAKATIME_ID_KEY)
+                if existing then existing:Destroy() end
+                
+                idValue.Parent = game:GetService("ReplicatedStorage")
+                
+                -- Add explanation comment
+                local comment = Instance.new("Message")
+                comment.Parent = idValue
+                comment.Text = "This is a WakaTime project identifier. Please don't delete it - it helps track your coding time consistently."
+            end)
+            
+            if success then
+                -- Update current project name
+                CurrentProject = "Project-" .. newId
+                -- Update project label in main GUI
+                if projectLabel then
+                    projectLabel.Text = "Project: " .. CurrentProject
+                end
+                projectIdInput.Text = "ID Set Successfully!"
+            else
+                projectIdInput.Text = "Failed to set ID"
+            end
+        end
+    end)
+
+    -- Status label at bottom (moved down to account for new controls)
     local statusLabel = Instance.new("TextLabel")
     statusLabel.Size = UDim2.new(0.9, 0, buttonHeight, 0)
-    statusLabel.Position = UDim2.new(0.05, 0, 0.92, 0)
+    statusLabel.Position = UDim2.new(0.05, 0, 0.95, 0)  -- Moved down slightly
     statusLabel.Text = "Status: Connected"
     statusLabel.TextColor3 = colors.SuccessColor
     statusLabel.BackgroundTransparency = 1
@@ -660,11 +843,19 @@ local function createGUI()
 
     -- Define updateStatus function
     local function updateStatus()
-        if IsOffline then
-            statusLabel.Text = "Status: Offline" .. (LastErrorCode and " (" .. LastErrorCode .. ")" or "")
+        if not WakaTimeAPIKey or WakaTimeAPIKey == "" then
+            statusLabel.Text = "Status: No API Key Set - Set your API key to start tracking"
+            statusLabel.TextColor3 = colors.WarningText
+        elseif IsOffline then
+            local errorText = LastStatusMessage ~= "" and (" - " .. LastStatusMessage) or ""
+            statusLabel.Text = "Status: Offline" .. (LastErrorCode and " (" .. LastErrorCode .. ")" or "") .. errorText
             statusLabel.TextColor3 = colors.ErrorColor
+        elseif not HasSuccessfullyConnected then
+            statusLabel.Text = "Status: Waiting for first connection..."
+            statusLabel.TextColor3 = colors.WarningText
         else
-            statusLabel.Text = "Status: Connected"
+            local queueText = #HeartbeatQueue > 0 and (" - " .. #HeartbeatQueue .. " items in queue") or ""
+            statusLabel.Text = "Status: Connected" .. (LastStatusMessage ~= "" and " - " .. LastStatusMessage or "") .. queueText
             statusLabel.TextColor3 = colors.SuccessColor
         end
     end
@@ -788,6 +979,72 @@ local function createGUI()
         createOSButton("Darwin", 1)
         createOSButton("Linux", 2)
 
+        -- Add Project ID Override section
+        local projectIdLabel = Instance.new("TextLabel")
+        projectIdLabel.Size = UDim2.new(0.9, 0, 0.15, 0)
+        projectIdLabel.Position = UDim2.new(0.05, 0, 0.5, 0)
+        projectIdLabel.Text = "Project ID Override:\n(Warning: This will change how your project appears in WakaTime)"
+        projectIdLabel.TextColor3 = colors.Text
+        projectIdLabel.BackgroundTransparency = 1
+        projectIdLabel.TextXAlignment = Enum.TextXAlignment.Left
+        projectIdLabel.TextYAlignment = Enum.TextYAlignment.Top
+        projectIdLabel.TextWrapped = true
+        projectIdLabel.Parent = dialog
+
+        local projectIdInput = Instance.new("TextBox")
+        projectIdInput.Size = UDim2.new(0.6, 0, 0.12, 0)
+        projectIdInput.Position = UDim2.new(0.05, 0, 0.65, 0)
+        projectIdInput.PlaceholderText = "Enter new project ID..."
+        projectIdInput.Text = ""
+        projectIdInput.TextColor3 = colors.Text
+        projectIdInput.BackgroundColor3 = colors.ButtonBackground
+        projectIdInput.Parent = dialog
+        addCorners(projectIdInput)
+
+        local setProjectIdButton = Instance.new("TextButton")
+        setProjectIdButton.Size = UDim2.new(0.25, 0, 0.12, 0)
+        setProjectIdButton.Position = UDim2.new(0.7, 0, 0.65, 0)
+        setProjectIdButton.Text = "Set ID"
+        setProjectIdButton.BackgroundColor3 = colors.ButtonBackground
+        setProjectIdButton.TextColor3 = colors.ButtonText
+        setProjectIdButton.Parent = dialog
+        addCorners(setProjectIdButton)
+
+        setProjectIdButton.MouseButton1Click:Connect(function()
+            local newId = projectIdInput.Text
+            if newId and newId ~= "" then
+                local idValue = Instance.new("StringValue")
+                idValue.Name = WAKATIME_ID_KEY
+                idValue.Value = newId
+                
+                -- Try to store in ReplicatedStorage first
+                local success = pcall(function()
+                    -- Remove existing ID if any
+                    local existing = game:GetService("ReplicatedStorage"):FindFirstChild(WAKATIME_ID_KEY)
+                    if existing then existing:Destroy() end
+                    
+                    idValue.Parent = game:GetService("ReplicatedStorage")
+                    
+                    -- Add explanation comment
+                    local comment = Instance.new("Message")
+                    comment.Parent = idValue
+                    comment.Text = "This is a WakaTime project identifier. Please don't delete it - it helps track your coding time consistently."
+                end)
+                
+                if success then
+                    -- Update current project name
+                    CurrentProject = "Project-" .. newId
+                    -- Update project label in main GUI
+                    if projectLabel then
+                        projectLabel.Text = "Project: " .. CurrentProject
+                    end
+                    dialog:Destroy()
+                else
+                    projectIdInput.Text = "Failed to set ID"
+                end
+            end
+        end)
+
         local closeButton = Instance.new("TextButton")
         closeButton.Size = UDim2.new(0.3, 0, 0.1, 0)
         closeButton.Position = UDim2.new(0.35, 0, 0.85, 0)
@@ -818,7 +1075,7 @@ local function createGUI()
         showDialog("Need Help?",
                 "If you're experiencing issues:\n\n" ..
                         "1. Open the Hack Club Slack\n" ..
-                        "2. Go to #highseas-help channel\n" ..
+                        "2. Go to #roblox-hackatime or #highseas-help channel\n" ..
                         "3. Describe your issue\n\n" ..
                         "The community will help you out!\n\n" ..
                         "Slack: hackclub.com/slack"
@@ -846,6 +1103,14 @@ local function createGUI()
         while true do
             wait(5)
             updateStatus()
+        end
+    end)
+
+    -- Add periodic refresh for project name
+    spawn(function()
+        while true do
+            wait(60) -- Refresh every minute
+            refreshProjectName()
         end
     end)
 
