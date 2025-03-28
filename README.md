@@ -15,7 +15,7 @@
 - **📝 Script Editing**: Monitors all your coding activities in real-time
 - **🌓 Dark/Light Mode**: Adapts to your Roblox Studio theme
 - **🔄 Auto-Sync**: Automatically syncs your coding time to WakaTime
-- **💾 Offline Support**: Keeps tracking even when you're offline!!!
+- **💾 Offline Support**: Keeps tracking even when you're offline!
 - **📊 Detailed Stats**: Tracks lines added, deleted, and modified
 
 ## 🚀 Quick Start
